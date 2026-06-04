@@ -1,0 +1,83 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# dvlt.cu — Jetson Dockerfile (ARM64)
+#
+# Targets (--build-arg ARCH=...):
+#   sm_87  Jetson Orin Nano / NX / AGX Orin   — JetPack 6.x  (default)
+#   sm_72  Jetson Xavier NX / AGX Xavier       — JetPack 5.x
+#
+# JetPack variants (--build-arg JETPACK=...):
+#   12.2.12   JetPack 6.x — Orin only          (default)
+#   11.4.19   JetPack 5.x — Xavier + Orin
+#
+# Build:
+#   docker build -f Dockerfile.jetson -t dvlt:jetson .
+#   docker build -f Dockerfile.jetson --build-arg ARCH=sm_72 --build-arg JETPACK=11.4.19 -t dvlt:jetson-xavier .
+#
+# First run — download weights (once, persists on host):
+#   docker run --rm --runtime nvidia \
+#     -v $(pwd)/model:/dvlt/model \
+#     dvlt:jetson --setup
+#
+# Inference:
+#   docker run --rm --runtime nvidia \
+#     -v $(pwd)/model:/dvlt/model:ro \
+#     -v /path/to/images:/input:ro \
+#     -v $(pwd)/output:/dvlt/output \
+#     dvlt:jetson -i /input
+# ─────────────────────────────────────────────────────────────────────────────
+
+ARG JETPACK=12.2.12
+
+# ── Stage 1: build ────────────────────────────────────────────────────────────
+FROM nvcr.io/nvidia/l4t-cuda:${JETPACK}-devel AS builder
+
+ARG ARCH=sm_87
+
+RUN apt-get update -qq && \
+    apt-get install -y --no-install-recommends \
+        git wget g++ make ca-certificates && \
+    rm -rf /var/lib/apt/lists/*
+
+WORKDIR /dvlt
+
+COPY . .
+
+# -mavx2 and -mfma are x86-only; strip them for ARM
+RUN sed -i 's/,-mavx2,-mfma//' Makefile
+
+# fetch CUTLASS headers (sparse blobless clone — only include/ + fused-attn example, ~25 MB)
+RUN tmp=$(mktemp -d) && \
+    git clone --depth 1 --filter=blob:none --no-checkout \
+        https://github.com/NVIDIA/cutlass.git "$tmp/cutlass" && \
+    git -C "$tmp/cutlass" sparse-checkout set \
+        include examples/41_fused_multi_head_attention && \
+    git -C "$tmp/cutlass" checkout && \
+    mkdir -p ext/cutlass/examples && \
+    cp -r "$tmp/cutlass/include" ext/cutlass/ && \
+    cp -r "$tmp/cutlass/examples/41_fused_multi_head_attention" ext/cutlass/examples/ && \
+    rm -rf "$tmp"
+
+RUN make convert ARCH=${ARCH} && make dvlt ARCH=${ARCH}
+
+# ── Stage 2: runtime ─────────────────────────────────────────────────────────
+FROM nvcr.io/nvidia/l4t-cuda:${JETPACK}-runtime
+
+WORKDIR /dvlt
+
+# binaries and tools
+COPY --from=builder /dvlt/build/dvlt    build/dvlt
+COPY --from=builder /dvlt/build/convert build/convert
+COPY --from=builder /dvlt/tools         tools/
+COPY --from=builder /dvlt/inputs        inputs/
+
+# weights are NOT baked in (252 MB, NVIDIA non-commercial license).
+# mount model/ from the host — see usage above.
+RUN apt-get update -qq && \
+    apt-get install -y --no-install-recommends wget ca-certificates && \
+    rm -rf /var/lib/apt/lists/*
+
+COPY entrypoint.jetson.sh /entrypoint.sh
+RUN chmod +x /entrypoint.sh
+
+ENTRYPOINT ["/entrypoint.sh"]
+CMD ["--help"]
